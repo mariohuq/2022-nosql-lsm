@@ -7,7 +7,6 @@ import jdk.incubator.foreign.ResourceScope;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -21,10 +20,12 @@ final class SortedStringTable {
 
     private final MemorySegment dataSegment;
     private final Index index;
+    public final boolean hasTombstones;
 
     private SortedStringTable(MemorySegment dataSegment, Index index) {
         this.dataSegment = dataSegment;
         this.index = index;
+        this.hasTombstones = index.hasTombstones();
     }
 
     /**
@@ -51,13 +52,13 @@ final class SortedStringTable {
                 index);
     }
 
-    public static void destroyFiles(Path folderPath) throws IOException, NoSuchFileException {
+    public static void destroyFiles(Path folderPath) throws IOException {
         Files.deleteIfExists(folderPath.resolve(DATA_FILENAME));
         Files.deleteIfExists(folderPath.resolve(INDEX_FILENAME));
         Files.delete(folderPath);
     }
 
-    public static SortedStringTable written(
+    public static SortedStringTable save(
             Path folderPath,
             Collection<MemorySegmentEntry> entries,
             ResourceScope scope
@@ -84,7 +85,7 @@ final class SortedStringTable {
         );
     }
 
-    public static SortedStringTable written(
+    public static void save(
             Path folderPath,
             Iterator<MemorySegmentEntry> iterator,
             ResourceScope scope
@@ -94,7 +95,7 @@ final class SortedStringTable {
         while (iterator.hasNext()) {
             entries.add(iterator.next());
         }
-        return written(folderPath, entries, scope);
+        save(folderPath, entries, scope);
     }
 
     /**
@@ -153,9 +154,8 @@ final class SortedStringTable {
      *
      * @return null if either indexFile or dataFile does not exist,
      *         null if key does not exist in table
-     * @throws IOException if other I/O error occurs
      */
-    public MemorySegmentEntry get(MemorySegment key) throws IOException {
+    public MemorySegmentEntry get(MemorySegment key) {
         int size = index.entriesMapped();
         int entryIndex = binarySearch(0, size, key);
         return entryIndex < 0 ? null : mappedEntry(entryIndex);
@@ -174,10 +174,11 @@ final class SortedStringTable {
 
         /**
          * write offsets in format:
-         * ┌─────────┬─────────────────┐
-         * │size: int│array: long[size]│
-         * └─────────┴─────────────────┘
-         * where size is number of entries and
+         * ┌─────────┬───────────────────┬─────────────────┐
+         * │size: int│ hasTombstones: int│array: long[size]│
+         * └─────────┴───────────────────┴─────────────────┘
+         * where size is number of entries,
+         * hasTombstones is 1 if there are tombstones in table or 0 otherwise, and
          * array represents offsets of entries in data file specified by methods
          * keyOffset, valueOffset, keySize and valueSize.
          */
@@ -189,25 +190,28 @@ final class SortedStringTable {
             MemorySegment indexSegment = MemorySegment.mapFile(
                     createFileIfNotExists(indexFile),
                     0L,
-                    Integer.BYTES + (1L + entries.size()) * Long.BYTES,
+                    Integer.BYTES + Integer.BYTES + (1L + entries.size()) * Long.BYTES,
                     FileChannel.MapMode.READ_WRITE,
                     scope
             );
             MemoryAccess.setInt(indexSegment, entries.size());
-            MemorySegment offsetsSegment = indexSegment.asSlice(Integer.BYTES);
+            MemorySegment offsetsSegment = indexSegment.asSlice(Integer.BYTES + Integer.BYTES);
             long currentOffset = 0L;
             long index = 0L;
             MemoryAccess.setLongAtIndex(offsetsSegment, index++, currentOffset);
+            boolean hasTombstones = false;
             for (MemorySegmentEntry entry : entries) {
                 currentOffset += entry.bytesSize();
+                hasTombstones |= entry.isTombstone();
                 MemoryAccess.setLongAtIndex(offsetsSegment, index++, currentOffset);
             }
+            MemoryAccess.setIntAtIndex(indexSegment, 1, hasTombstones ? 1 : 0);
             indexSegment.force();
             return new Index(indexSegment.asReadOnly());
         }
 
         long entryOffset(long i) {
-            return MemoryAccess.getLongAtOffset(indexSegment, Integer.BYTES + i * Long.BYTES);
+            return MemoryAccess.getLongAtOffset(indexSegment, Integer.BYTES + Integer.BYTES + i * Long.BYTES);
         }
 
         long entrySize(long i) {
@@ -216,6 +220,10 @@ final class SortedStringTable {
 
         int entriesMapped() {
             return MemoryAccess.getIntAtOffset(indexSegment, 0L);
+        }
+
+        boolean hasTombstones() {
+            return MemoryAccess.getIntAtOffset(indexSegment, 1L) != 0;
         }
 
         long dataSize() {

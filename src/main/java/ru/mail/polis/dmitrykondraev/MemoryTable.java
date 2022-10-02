@@ -10,19 +10,9 @@ import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 class MemoryTable {
-    private final AtomicLong byteSize;
-    private final ConcurrentNavigableMap<MemorySegment, MemorySegmentEntry> map;
-    final MemoryTable previous;
-
-    MemoryTable(
-            AtomicLong byteSize,
-            ConcurrentNavigableMap<MemorySegment, MemorySegmentEntry> map,
-            MemoryTable previous
-    ) {
-        this.byteSize = byteSize;
-        this.map = map;
-        this.previous = previous;
-    }
+    private final AtomicLong byteSize = new AtomicLong();
+    private final ConcurrentNavigableMap<MemorySegment, MemorySegmentEntry> map =
+            new ConcurrentSkipListMap<>(MemorySegmentComparator.INSTANCE);
 
     /**
      * Insert or update entry.
@@ -31,16 +21,13 @@ class MemoryTable {
      */
     public long upsert(MemorySegmentEntry entry) {
         // implicit check for non-null entry and entry.key()
+        // TODO check for threshold
         map.put(entry.key(), entry);
         return byteSize.addAndGet(entry.bytesSize());
     }
 
     public MemorySegmentEntry get(MemorySegment key) {
-        MemorySegmentEntry entry = map.get(key);
-        if ((entry == null || entry.isTombStone()) && previous != null) {
-            return previous.get(key);
-        }
-        return entry;
+        return map.get(key);
     }
 
     public Iterator<MemorySegmentEntry> get(MemorySegment from, MemorySegment to) {
@@ -48,36 +35,12 @@ class MemoryTable {
         return iterator(subMap);
     }
 
-    public boolean isEmpty() {
-        return map.isEmpty() || (previous != null && previous.isEmpty());
-    }
-
     public Collection<MemorySegmentEntry> values() {
-        if (previous != null) {
-            throw new IllegalStateException("Can't ask for values with previous state");
-        }
         return map.values();
     }
 
-    public MemoryTable dropPrevious() {
-        return new MemoryTable(byteSize, map, null);
-    }
-
-    public MemoryTable forward() {
-        if (previous != null) {
-            throw new IllegalStateException("Can't forward with previous state");
-        }
-        return new MemoryTable(
-                new AtomicLong(),
-                new ConcurrentSkipListMap<>(MemorySegmentComparator.INSTANCE),
-                this);
-    }
-
-    public static MemoryTable of() {
-        return new MemoryTable(
-                new AtomicLong(),
-                new ConcurrentSkipListMap<>(MemorySegmentComparator.INSTANCE),
-                null);
+    public boolean isEmpty() {
+        return map.isEmpty();
     }
 
     private static <K, V> Iterator<V> iterator(Map<K, V> map) {

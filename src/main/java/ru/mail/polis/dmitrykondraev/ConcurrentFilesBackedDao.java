@@ -1,77 +1,47 @@
 package ru.mail.polis.dmitrykondraev;
 
-import jdk.incubator.foreign.MemorySegment;
-import jdk.incubator.foreign.ResourceScope;
-import ru.mail.polis.Config;
-import ru.mail.polis.Dao;
-
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Spliterator;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.stream.Stream;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import static ru.mail.polis.dmitrykondraev.Files.filenameOf;
+import jdk.incubator.foreign.MemorySegment;
+import ru.mail.polis.Config;
+import ru.mail.polis.Dao;
 
 /**
  * Author: Dmitry Kondraev.
  */
 public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, MemorySegmentEntry> {
-    private static final String COMPACT_NAME = "compacted";
-    private static final String TABLE_PREFIX = "table";
-    private static final String TMP_SUFFIX = "-temp";
 
-    private final BackgroundIOExecutor backgroundExecutor = new BackgroundIOExecutor();
-    private final Path basePath;
-    private final Path compactDir;
-    private final Path compactDirTmp;
+    private final ExecutorService backgroundExecutor =
+            Executors.newSingleThreadExecutor(r -> new Thread(r, "ConcurrentFilesBackedDaoBackground"));
     private final long flushThresholdBytes;
-    /**
-     * ordered from most recent to the earliest.
-     */
-    private final List<SortedStringTable> sortedStringTables = new CopyOnWriteArrayList<>();
-    private final AtomicReference<MemoryTable> memoryTable = new AtomicReference<>(MemoryTable.of());
-    private final ResourceScope scope = ResourceScope.newSharedScope();
 
-    private ConcurrentFilesBackedDao(Config config) {
-        basePath = config.basePath();
-        compactDir = basePath.resolve(COMPACT_NAME);
-        compactDirTmp = basePath.resolve(COMPACT_NAME + TMP_SUFFIX);
+    private volatile State state;
+
+    private final ReadWriteLock upsertLock = new ReentrantReadWriteLock();
+
+    private ConcurrentFilesBackedDao(Config config, State state) {
         flushThresholdBytes = config.flushThresholdBytes();
+        this.state = state;
     }
 
     public static ConcurrentFilesBackedDao of(Config config) throws IOException {
-        ConcurrentFilesBackedDao dao = new ConcurrentFilesBackedDao(config);
-        try (Stream<Path> stream = Files.list(dao.basePath)) {
-            Iterator<Path> pathIterator = stream
-                    .filter(subDirectory -> filenameOf(subDirectory).startsWith(TABLE_PREFIX))
-                    .sorted(Comparator.comparing(ru.mail.polis.dmitrykondraev.Files::filenameOf).reversed())
-                    .iterator();
-            while (pathIterator.hasNext()) {
-                // TODO perf
-                dao.sortedStringTables.add(SortedStringTable.of(pathIterator.next(), dao.scope));
-            }
-        }
-        if (Files.exists(dao.compactDirTmp)) {
-            SortedStringTable.destroyFiles(dao.compactDirTmp);
-            dao.compactImpl();
-            return dao;
-        }
-        if (Files.exists(dao.compactDir)) {
-            dao.finishCompaction();
-        }
-        return dao;
+        return new ConcurrentFilesBackedDao(
+                config,
+                State.newState(Storage.load(config.basePath()))
+        );
     }
 
     @Override
@@ -79,24 +49,24 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
         if (from == null) {
             return get(MemorySegmentComparator.MINIMAL, to);
         }
-        MemoryTable table = memoryTable.get();
-        PeekIterator<MemorySegmentEntry> inMemoryIterator = new PeekIterator<>(table.get(from, to));
-        Spliterator<SortedStringTable> tableSpliterator = sortedStringTables.spliterator();
+        State state = accessState();
+        PeekIterator<MemorySegmentEntry> inMemoryIterator = new PeekIterator<>(state.memoryTable.get(from, to));
+        Spliterator<SortedStringTable> tableSpliterator = state.storage.spliterator();
         int tablesCount = (int) tableSpliterator.getExactSizeIfKnown();
-        if (tablesCount == 0 && table.previous == null) {
+        if (tablesCount == 0 && state.flushingTable == null) {
             return withoutTombStones(inMemoryIterator);
         }
         List<PeekIterator<MemorySegmentEntry>> iterators =
-                new ArrayList<>((table.previous == null ? 1 : 2) + tablesCount);
+                new ArrayList<>(1 + (state.flushingTable == null ? 0 : 1) + tablesCount);
         iterators.add(inMemoryIterator);
-        if (table.previous != null) {
-            iterators.add(new PeekIterator<>(table.previous.get(from, to)));
+        if (state.flushingTable != null) {
+            iterators.add(new PeekIterator<>(state.flushingTable.get(from, to)));
         }
         tableSpliterator.forEachRemaining(t -> iterators.add(new PeekIterator<>(t.get(from, to))));
         return withoutTombStones(new PeekIterator<>(MergedIterator.of(iterators)));
     }
 
-    private static Iterator<MemorySegmentEntry> allStored(Spliterator<SortedStringTable> tableSpliterator) {
+    static Iterator<MemorySegmentEntry> allStored(Spliterator<SortedStringTable> tableSpliterator) {
         List<PeekIterator<MemorySegmentEntry>> iterators =
                 new ArrayList<>((int) tableSpliterator.getExactSizeIfKnown());
         tableSpliterator.forEachRemaining(t ->
@@ -106,23 +76,60 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
 
     @Override
     public void upsert(MemorySegmentEntry entry) {
-        long byteSizeAfter = memoryTable.get().upsert(entry);
-        if (byteSizeAfter >= flushThresholdBytes) {
-            backgroundExecutor.execute(this::flushImpl);
+        State state = this.state;
+        long byteSizeAfter;
+        // it is intentionally the read lock.
+        upsertLock.readLock().lock();
+        try {
+            byteSizeAfter = state.memoryTable.upsert(entry);
+        } finally {
+            upsertLock.readLock().unlock();
         }
+        if (byteSizeAfter >= flushThresholdBytes) {
+            flushInBackground(false);
+        }
+    }
+
+    private Future<?> flushInBackground(boolean tolerantToOngoingFlush) {
+        upsertLock.writeLock().lock();
+        try {
+            State state = accessState();
+            if (state.isFlushing()) {
+                if (tolerantToOngoingFlush) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                throw new TooManyBackgroundFlushesException();
+            }
+            this.state = state.flushing();
+        } finally {
+            upsertLock.writeLock().unlock();
+        }
+
+        return backgroundExecutor.submit(() -> {
+            try {
+                flushImpl();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
     }
 
     @Override
     public MemorySegmentEntry get(MemorySegment key) throws IOException {
-        MemorySegmentEntry result = memoryTable.get().get(key);
+        State state = accessState();
+        MemorySegmentEntry result = state.memoryTable.get(key);
         if (result != null) {
             return result.isTombStone() ? null : result;
         }
-        for (SortedStringTable table : sortedStringTables) {
-            MemorySegmentEntry entry = table.get(key);
-            if (entry != null) {
-                return entry.isTombStone() ? null : entry;
+        if (state.isFlushing()) {
+            result = state.flushingTable.get(key);
+            if (result != null) {
+                return result.isTombStone() ? null : result;
             }
+        }
+        result = state.storage.get(key);
+        if (result != null) {
+            return result.isTombStone() ? null : result;
         }
         return null;
     }
@@ -130,7 +137,7 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
     @Override
     public void flush() {
         try {
-            backgroundExecutor.submit(this::flushImpl).get();
+            flushInBackground(true).get();
         } catch (ExecutionException e) {
             throw new RuntimeException(e);
         } catch (InterruptedException e) {
@@ -139,21 +146,33 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
     }
 
     private void flushImpl() throws IOException {
-        MemoryTable previous = memoryTable.getAndUpdate(MemoryTable::forward);
-        if (previous.isEmpty()) {
-            return;
+        State state = accessState();
+        if (state.flushingTable.isEmpty()) {
+            throw new IllegalStateException("Trying to flush empty MemoryTable");
         }
-        Path tablePath = Files.createDirectory(sortedStringTablePath(sortedStringTables.size()));
-        sortedStringTables.add(
-                0,
-                SortedStringTable.written(tablePath, previous.values(), scope));
-        memoryTable.getAndUpdate(MemoryTable::dropPrevious);
+        Storage storage = state.storage.store(state.flushingTable.values());
+        upsertLock.writeLock().lock();
+        try {
+            this.state = state.afterFlush(storage);
+        } finally {
+            upsertLock.writeLock().unlock();
+        }
     }
 
     @Override
     public void compact() {
+        State beforeCompactState = accessState();
+        if (beforeCompactState.storage.isCompacted()) {
+            return;
+        }
         try {
-            backgroundExecutor.submit(this::compactImpl).get();
+            backgroundExecutor.submit(() -> {
+                try {
+                    compactImpl();
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }).get();
         } catch (ExecutionException e) {
             throw new RuntimeException(e);
         } catch (InterruptedException e) {
@@ -162,28 +181,33 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
     }
 
     private void compactImpl() throws IOException {
-        Spliterator<SortedStringTable> tableSpliterator = sortedStringTables.spliterator();
-        if (tableSpliterator.getExactSizeIfKnown() == 0) {
+        State state = accessState();
+        if (state.storage.isCompacted()) {
             return;
         }
-        ResourceScope confinedScope = ResourceScope.newConfinedScope();
-        SortedStringTable.written(Files.createDirectory(compactDirTmp), allStored(tableSpliterator), confinedScope);
-        confinedScope.close();
-        Files.move(compactDirTmp, compactDir, StandardCopyOption.ATOMIC_MOVE);
+        state.storage.compact(allStored(state.storage.spliterator()));
         finishCompaction();
     }
 
     @Override
-    public void close() throws IOException {
-        backgroundExecutor.service.shutdown();
+    public synchronized void close() throws IOException {
+        State state = this.state;
+        if (state.isClosed) {
+            return; // close() is idempotent
+        }
+        backgroundExecutor.shutdown();
         boolean interrupted = false;
         try {
-            interrupted = !backgroundExecutor.service.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
+            interrupted = !backgroundExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
         } catch (InterruptedException e) {
             interrupted = true;
         } finally {
-            flushImpl();
-            scope.close();
+            if (!state.memoryTable.isEmpty()) {
+                this.state = state.flushing();
+                flushImpl();
+            }
+            state.storage.close();
+            this.state = state.afterClosed();
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
@@ -191,24 +215,14 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
     }
 
     private void finishCompaction() throws IOException {
-        for (int i = sortedStringTables.size() - 1; i >= 0; i--) {
-            SortedStringTable.destroyFiles(sortedStringTablePath(i));
+        State state = accessState();
+        Storage storage = state.storage.finishCompact();
+        upsertLock.writeLock().lock();
+        try {
+            this.state = state.afterCompact(storage);
+        } finally {
+            upsertLock.writeLock().unlock();
         }
-        sortedStringTables.clear();
-        Path table0 = sortedStringTablePath(0);
-        Files.move(compactDir, table0, StandardCopyOption.ATOMIC_MOVE);
-        sortedStringTables.add(0, SortedStringTable.of(table0, scope));
-    }
-
-    private Path sortedStringTablePath(int index) {
-        if (index < 0) {
-            throw new IllegalArgumentException("Negative index");
-        }
-        // 10^10 > Integer.MAX_VALUE
-        String value = String.valueOf(index);
-        char[] zeros = new char[10 - value.length()];
-        Arrays.fill(zeros, '0');
-        return basePath.resolve(TABLE_PREFIX + new String(zeros) + value);
     }
 
     private static Iterator<MemorySegmentEntry> withoutTombStones(PeekIterator<MemorySegmentEntry> iterator) {
@@ -233,4 +247,68 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
             }
         };
     }
+
+    private State accessState() {
+        State state = this.state;
+        state.assertNotClosed();
+        return state;
+    }
+
+    /*
+     * Provides atomic access to MemoryTable + Storage state via
+     * `final` guarantees + volatile variable State.
+     */
+    private static class State {
+        final Storage storage;
+        final MemoryTable memoryTable;
+        final MemoryTable flushingTable;
+        final boolean isClosed;
+
+        private State(Storage storage, MemoryTable memoryTable, MemoryTable flushingTable, boolean isClosed) {
+            this.storage = storage;
+            this.memoryTable = memoryTable;
+            this.flushingTable = flushingTable;
+            this.isClosed = isClosed;
+        }
+
+        boolean isFlushing() {
+            return flushingTable != null;
+        }
+
+        State afterFlush(Storage storage) {
+            assertNotClosed();
+            return new State(storage, memoryTable, null, false);
+        }
+
+        public void assertNotClosed() {
+            if (isClosed) {
+                throw new IllegalStateException("Dao is already closed");
+            }
+        }
+
+        State flushing() {
+            assertNotClosed();
+            if (isFlushing()) {
+                throw new IllegalStateException("Trying to flush twice: already flushing");
+            }
+            return new State(storage, new MemoryTable(), memoryTable, false);
+        }
+
+        State afterClosed() {
+            assertNotClosed();
+            if (!storage.isClosed()) {
+                throw new IllegalStateException("Storage should be closed before Dao");
+            }
+            return new State(storage, memoryTable, flushingTable, true);
+        }
+        static State newState(Storage storage) {
+            return new State(storage, new MemoryTable(), null, false);
+        }
+
+        public State afterCompact(Storage storage) {
+            assertNotClosed();
+            return new State(storage, memoryTable, flushingTable, false);
+        }
+    }
+
 }
