@@ -1,5 +1,8 @@
 package ru.mail.polis.dmitrykondraev;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -23,13 +26,12 @@ import ru.mail.polis.Dao;
  * Author: Dmitry Kondraev.
  */
 public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, MemorySegmentEntry> {
+    private static final Logger LOG = LoggerFactory.getLogger(ConcurrentFilesBackedDao.class);
 
     private final ExecutorService backgroundExecutor =
             Executors.newSingleThreadExecutor(r -> new Thread(r, "ConcurrentFilesBackedDaoBackground"));
     private final long flushThresholdBytes;
-
     private volatile State state;
-
     private final ReadWriteLock upsertLock = new ReentrantReadWriteLock();
 
     private ConcurrentFilesBackedDao(Config config, State state) {
@@ -100,7 +102,8 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
                 }
                 throw new TooManyBackgroundFlushesException();
             }
-            this.state = state.flushing();
+            state = state.flushing();
+            this.state = state;
         } finally {
             upsertLock.writeLock().unlock();
         }
@@ -108,7 +111,9 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
         return backgroundExecutor.submit(() -> {
             try {
                 flushImpl();
-            } catch (IOException e) {
+            } catch (Exception e) {
+                LOG.error("Can't flush", e);
+                this.state.storage.close();
                 throw new RuntimeException(e);
             }
         });
@@ -153,7 +158,8 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
         Storage storage = state.storage.store(state.flushingTable.values());
         upsertLock.writeLock().lock();
         try {
-            this.state = state.afterFlush(storage);
+            state = state.afterFlush(storage);
+            this.state = state;
         } finally {
             upsertLock.writeLock().unlock();
         }
@@ -203,11 +209,11 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
             interrupted = true;
         } finally {
             if (!state.memoryTable.isEmpty()) {
-                this.state = state.flushing();
-                flushImpl();
+                state.storage.store(state.memoryTable.values());
             }
             state.storage.close();
-            this.state = state.afterClosed();
+            state = state.afterClosed();
+            this.state = state;
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
@@ -219,7 +225,8 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
         Storage storage = state.storage.finishCompact();
         upsertLock.writeLock().lock();
         try {
-            this.state = state.afterCompact(storage);
+            state = state.afterCompact(storage);
+            this.state = state;
         } finally {
             upsertLock.writeLock().unlock();
         }
@@ -310,5 +317,4 @@ public final class ConcurrentFilesBackedDao implements Dao<MemorySegment, Memory
             return new State(storage, memoryTable, flushingTable, false);
         }
     }
-
 }

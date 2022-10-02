@@ -1,6 +1,7 @@
 package ru.mail.polis.dmitrykondraev;
 
 import java.io.IOException;
+import java.lang.ref.Cleaner;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -23,6 +24,14 @@ public class Storage {
     private static final String COMPACT_NAME = "compacted";
     private static final String TABLE_PREFIX = "table";
     private static final String TMP_SUFFIX = "-temp";
+
+    private static final Cleaner CLEANER = Cleaner.create((Runnable r) -> new Thread(r, "Storage-Cleaner") {
+        @Override
+        public synchronized void start() {
+            setDaemon(true);
+            super.start();
+        }
+    });
 
     /**
      * ordered from most recent to the earliest.
@@ -55,7 +64,7 @@ public class Storage {
 
     public static Storage load(Path basePath) throws IOException {
         List<SortedStringTable> sortedStringTables = new ArrayList<>();
-        ResourceScope scope = ResourceScope.newSharedScope();
+        ResourceScope scope = ResourceScope.newSharedScope(CLEANER);
         try (Stream<Path> stream = Files.list(basePath)) {
             Iterator<Path> pathIterator = stream
                     .filter(subDirectory -> filenameOf(subDirectory).startsWith(TABLE_PREFIX))
@@ -110,9 +119,9 @@ public class Storage {
     }
 
     public void compact(Iterator<MemorySegmentEntry> data) throws IOException {
-        ResourceScope confinedScope = ResourceScope.newConfinedScope();
-        SortedStringTable.save(Files.createDirectory(compactDirTmp), data, confinedScope);
-        confinedScope.close();
+        try (ResourceScope confinedScope = ResourceScope.newConfinedScope()) {
+            SortedStringTable.save(Files.createDirectory(compactDirTmp), data, confinedScope);
+        }
         Files.move(compactDirTmp, compactDir, StandardCopyOption.ATOMIC_MOVE);
     }
 
@@ -131,7 +140,13 @@ public class Storage {
     }
 
     public void close() {
-        scope.close();
+        while (scope.isAlive()) {
+            try {
+                scope.close();
+                return;
+            } catch (IllegalStateException ignored) {
+            }
+        }
     }
 
     public boolean isClosed() {
